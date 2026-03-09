@@ -934,6 +934,48 @@ def add_world_axes_actor(pl: pv.Plotter,
             )
 
 
+def add_platform_axes_actor(pl: pv.Plotter,
+                            origin=(0.0, 0.0, 0.0),
+                            axis_length=0.5,
+                            shaft_radius=0.01,
+                            tip_length=0.08,
+                            tip_radius=0.02,
+                            show_labels=True):
+    """添加平台坐标系（橙色系）"""
+    pl.add_mesh(pv.Sphere(radius=shaft_radius * 2.5, center=origin), color="orange")
+
+    dirs = {
+        "X": np.array([1.0, 0.0, 0.0]),
+        "Y": np.array([0.0, 1.0, 0.0]),
+        "Z": np.array([0.0, 0.0, 1.0]),
+    }
+    colors = {"X": "darkorange", "Y": "gold", "Z": "chocolate"}
+
+    for name, d in dirs.items():
+        start = np.array(origin, dtype=float)
+        end = start + d * axis_length
+
+        arrow = pv.Arrow(
+            start=start,
+            direction=d,
+            tip_length=tip_length,
+            tip_radius=tip_radius,
+            shaft_radius=shaft_radius,
+            scale=axis_length
+        )
+        pl.add_mesh(arrow, color=colors[name])
+
+        if show_labels:
+            pl.add_point_labels(
+                np.array([end]),
+                [f"P_{name}"],  # 平台坐标系标签
+                font_size=16,
+                point_size=0,
+                shape_opacity=0.15,
+                text_color=colors[name]
+            )
+
+
 def compute_platform_real_coordinates(grid2d_all: np.ndarray,
                                       nodes_xyz: np.ndarray,
                                       rows: int = GRID_ROWS,
@@ -1007,6 +1049,7 @@ def compute_platform_real_coordinates(grid2d_all: np.ndarray,
 
 def export_platform_coordinates(platform_holes_real_3d: np.ndarray,
                                 platform_base_point: np.ndarray,
+                                platform_holes_projected_3d: np.ndarray,
                                 hole_heights: np.ndarray,
                                 rows: int = GRID_ROWS,
                                 cols: int = GRID_COLS,
@@ -1015,8 +1058,9 @@ def export_platform_coordinates(platform_holes_real_3d: np.ndarray,
     导出平台孔位坐标到CSV文件
 
     参数:
-        platform_holes_real_3d: 平台孔位的真实3D坐标 (N, 3)
-        platform_base_point: 平台基准点坐标 (3,)
+        platform_holes_real_3d: 平台孔位的真实3D坐标 (N, 3)，在壁板PCA坐标系中
+        platform_base_point: 平台基准点坐标 (3,)，在壁板PCA坐标系中
+        platform_holes_projected_3d: 平台孔位投影到壁板的3D坐标 (N, 3)
         hole_heights: 每个孔位到壁板的高度 (N,)
         rows: 平台行数
         cols: 平台列数
@@ -1024,21 +1068,48 @@ def export_platform_coordinates(platform_holes_real_3d: np.ndarray,
     """
     os.makedirs(os.path.dirname(export_path) if os.path.dirname(export_path) else ".", exist_ok=True)
 
+    # 计算以平台左下角为原点的相对坐标
+    platform_holes_relative = platform_holes_real_3d - platform_base_point
+    platform_holes_projected_relative = platform_holes_projected_3d - platform_base_point
+
     with open(export_path, "w", encoding="utf-8") as f:
         f.write("# Platform Coordinate System Information\n")
-        f.write(f"# Base Point (left-bottom corner, first hole): X={platform_base_point[0]:.6f}m, Y={platform_base_point[1]:.6f}m, Z={platform_base_point[2]:.6f}m\n")
+        f.write(f"# Base Point (left-bottom corner, first hole) in Panel PCA coord: X={platform_base_point[0]:.6f}m, Y={platform_base_point[1]:.6f}m, Z={platform_base_point[2]:.6f}m\n")
         f.write(f"# Grid: {rows} rows x {cols} cols = {rows*cols} holes\n")
         f.write(f"# Spacing: {GRID_SPACING_M}m\n")
         f.write(f"# Platform to panel min height: {PLATFORM_TO_PANEL_MIN_HEIGHT_M}m ({PLATFORM_TO_PANEL_MIN_HEIGHT_M*1000:.0f}mm)\n")
         f.write("#\n")
-        f.write("row,col,x_real(m),y_real(m),z_real(m),height_to_panel(m),height_to_panel(mm)\n")
+        f.write("# Coordinate Systems:\n")
+        f.write("# - Panel PCA coord: PCA-aligned panel coordinate system (origin at panel center)\n")
+        f.write("# - Platform coord: Platform coordinate system (origin at left-bottom corner hole)\n")
+        f.write("#\n")
+        f.write("row,col,")
+        f.write("x_panel(m),y_panel(m),z_panel(m),")  # 壁板坐标系中的平台孔位坐标
+        f.write("x_platform(m),y_platform(m),z_platform(m),")  # 平台坐标系中的孔位坐标
+        f.write("x_proj_panel(m),y_proj_panel(m),z_proj_panel(m),")  # 投影点在壁板坐标系中的坐标
+        f.write("x_proj_platform(m),y_proj_platform(m),z_proj_platform(m),")  # 投影点在平台坐标系中的坐标
+        f.write("height_to_panel(m),height_to_panel(mm)\n")
 
         idx = 0
         for r in range(rows):
             for c in range(cols):
-                x, y, z = platform_holes_real_3d[idx]
+                # 壁板坐标系中的平台孔位坐标
+                x_panel, y_panel, z_panel = platform_holes_real_3d[idx]
+                # 平台坐标系中的孔位坐标
+                x_plat, y_plat, z_plat = platform_holes_relative[idx]
+                # 投影点在壁板坐标系中的坐标
+                x_proj_panel, y_proj_panel, z_proj_panel = platform_holes_projected_3d[idx]
+                # 投影点在平台坐标系中的坐标
+                x_proj_plat, y_proj_plat, z_proj_plat = platform_holes_projected_relative[idx]
+                # 高度
                 h = hole_heights[idx]
-                f.write(f"{r},{c},{x:.6f},{y:.6f},{z:.6f},{h:.6f},{h*1000:.2f}\n")
+
+                f.write(f"{r},{c},")
+                f.write(f"{x_panel:.6f},{y_panel:.6f},{z_panel:.6f},")
+                f.write(f"{x_plat:.6f},{y_plat:.6f},{z_plat:.6f},")
+                f.write(f"{x_proj_panel:.6f},{y_proj_panel:.6f},{z_proj_panel:.6f},")
+                f.write(f"{x_proj_plat:.6f},{y_proj_plat:.6f},{z_proj_plat:.6f},")
+                f.write(f"{h:.6f},{h*1000:.2f}\n")
                 idx += 1
 
     print(f"💾 已导出平台孔位坐标: {export_path}")
@@ -1061,7 +1132,8 @@ def visualize_scene(nodes_xyz: np.ndarray,
                     show_fixture_spheres: bool = True,
                     sphere_opacity: float = 0.18,
                     show_move_labels: bool = True,
-                    show_height_labels: bool = True):
+                    show_height_labels: bool = True,
+                    show_platform_coord_labels: bool = True):
     cloud = pv.PolyData(nodes_xyz)
     pl = pv.Plotter()
     pl.set_background("white")
@@ -1137,7 +1209,7 @@ def visualize_scene(nodes_xyz: np.ndarray,
         correspondence_poly = make_segment_polydata(platform_holes_real_3d, platform_holes_projected_3d)
         pl.add_mesh(correspondence_poly, color="cyan", line_width=1, opacity=0.3)
 
-    # 显示每个孔位到壁板的高度标签
+    # 显示每个孔位到壁板的高度标签（保留小数）
     if show_height_labels and hole_heights is not None and platform_holes_real_3d is not None and len(platform_holes_real_3d) > 0:
         # 在平台孔位和投影位置的中点显示高度标签
         if platform_holes_projected_3d is not None and len(platform_holes_projected_3d) == len(platform_holes_real_3d):
@@ -1147,8 +1219,8 @@ def visualize_scene(nodes_xyz: np.ndarray,
             label_positions = platform_holes_real_3d.copy()
             label_positions[:, 2] += 0.05  # 向上偏移50mm
 
-        # 生成高度标签（单位：mm）
-        height_labels = [f"{h*1000:.0f}mm" for h in hole_heights]
+        # 生成高度标签（单位：mm，保留2位小数）
+        height_labels = [f"{h*1000:.2f}mm" for h in hole_heights]
 
         pl.add_point_labels(
             label_positions,
@@ -1159,11 +1231,102 @@ def visualize_scene(nodes_xyz: np.ndarray,
             text_color="blue"
         )
 
+    # 显示平台坐标原点（左下角基准点）和平台坐标系
+    if platform_holes_real_3d is not None and len(platform_holes_real_3d) > 0:
+        # 平台基准点就是第一个孔位
+        platform_origin = platform_holes_real_3d[0]
+
+        # 添加平台坐标系（橙色系）
+        add_platform_axes_actor(
+            pl,
+            origin=platform_origin,
+            axis_length=0.3,
+            shaft_radius=0.008,
+            tip_length=0.15,
+            tip_radius=0.015,
+            show_labels=True
+        )
+
+        # 可视化两个坐标系的相对位置关系
+        # 壁板坐标系原点在 (0, 0, 0)
+        panel_origin = np.array([0.0, 0.0, 0.0])
+
+        # 添加连线显示两个原点之间的偏差
+        origin_line = pv.Line(panel_origin, platform_origin)
+        pl.add_mesh(origin_line, color="purple", line_width=5, label="Origin offset")
+
+        # 在连线中点添加偏差距离标签
+        offset_vector = platform_origin - panel_origin
+        offset_distance = np.linalg.norm(offset_vector)
+        midpoint = (panel_origin + platform_origin) / 2.0
+
+        offset_label = f"Δ={offset_distance*1000:.2f}mm\n" \
+                      f"ΔX={offset_vector[0]*1000:.2f}mm\n" \
+                      f"ΔY={offset_vector[1]*1000:.2f}mm\n" \
+                      f"ΔZ={offset_vector[2]*1000:.2f}mm"
+
+        pl.add_point_labels(
+            np.array([midpoint]),
+            [offset_label],
+            font_size=14,
+            point_size=0,
+            shape_opacity=0.3,
+            text_color="purple",
+            bold=True
+        )
+
+        # 显示平台坐标系下所有孔位的XYZ坐标标签
+        if show_platform_coord_labels:
+            # 计算相对于平台原点的坐标
+            platform_holes_relative = platform_holes_real_3d - platform_origin
+
+            # 为每个孔位生成坐标标签（只显示部分点，避免太密集）
+            # 显示四个角点和中心点
+            n_holes = len(platform_holes_real_3d)
+            rows = GRID_ROWS
+            cols = GRID_COLS
+
+            # 选择要显示标签的孔位索引：四个角 + 中心
+            indices_to_label = [
+                0,  # 左下角
+                cols - 1,  # 右下角
+                (rows - 1) * cols,  # 左上角
+                rows * cols - 1,  # 右上角
+                (rows // 2) * cols + (cols // 2)  # 中心
+            ]
+
+            coord_label_positions = []
+            coord_labels = []
+
+            for idx in indices_to_label:
+                if idx < n_holes:
+                    rel_coord = platform_holes_relative[idx]
+                    # 标签位置：在孔位旁边偏移
+                    label_pos = platform_holes_real_3d[idx].copy()
+                    label_pos[2] -= 0.08  # 向下偏移80mm
+
+                    coord_label_positions.append(label_pos)
+                    coord_labels.append(
+                        f"P({rel_coord[0]*1000:.1f}, {rel_coord[1]*1000:.1f}, {rel_coord[2]*1000:.1f})mm"
+                    )
+
+            if coord_label_positions:
+                pl.add_point_labels(
+                    np.array(coord_label_positions),
+                    coord_labels,
+                    font_size=11,
+                    point_size=0,
+                    shape_opacity=0.25,
+                    text_color="darkorange"
+                )
+
     pl.add_text(
         "LightGray:grid | Black:invalid | Magenta:valid(moved) | Red:original position | Yellow:nodes covered\n"
         "Blue:Platform holes (real) | Lime:Platform holes (projected) | Cyan:correspondence | Blue labels:height(mm)\n"
+        "Red axes(X,Y,Z):Panel coord | Orange axes(P_X,P_Y,P_Z):Platform coord | Purple line:Origin offset\n"
+        "Orange labels:Platform coord P(x,y,z) | Purple label:Coordinate system offset\n"
         "NOTE: XY axes are PCA-aligned (not original CAD global axes). Grid coordinates shown are PCA-XY.",
-        font_size=11
+        font_size=10
     )
 
     bounds = pv.PolyData(nodes_xyz).bounds
@@ -1385,6 +1548,7 @@ def main():
     export_platform_coordinates(
         platform_holes_real_3d=platform_holes_real_3d,
         platform_base_point=platform_base_point,
+        platform_holes_projected_3d=platform_holes_projected_3d,
         hole_heights=hole_heights,
         rows=GRID_ROWS,
         cols=GRID_COLS,
@@ -1409,7 +1573,8 @@ def main():
         show_fixture_spheres=True,
         sphere_opacity=0.18,
         show_move_labels=SHOW_MOVE_LABELS,
-        show_height_labels=True
+        show_height_labels=True,
+        show_platform_coord_labels=True
     )
 
 if __name__ == "__main__":
