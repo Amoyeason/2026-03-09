@@ -38,6 +38,9 @@ GRID_COLS = 24
 FIXTURE_RADIUS_M = 0.0625
 SAFETY_MARGIN_M = 0.0
 
+# 平台高度参数（考虑POGO柱高度）
+PLATFORM_TO_PANEL_MIN_HEIGHT_M = 0.35  # 350mm，平台平面到壁板最低点的初始高度
+
 # 动态边缘邻域：在当前孔阵偏移下，薄板边缘附近的 POGO（无论当前在板内还是板外）都允许 XY 移动；内部深处 POGO 只允许升降
 EDGE_NEAR_BAND_M = 0.12
 
@@ -51,7 +54,7 @@ GRID_ORIGIN_CUSTOM = (0.0, 0.0)
 # ============= 平台孔阵相对位置扫描（dx,dy in [0, spacing)） =============
 OFFSET_SCAN_ENABLE = True
 # 扫描步长（建议 0.01=10mm；更精细可用 0.005=5mm 或 0.002=2mm）
-OFFSET_SCAN_STEP_M = 0.002
+OFFSET_SCAN_STEP_M = 0.01
 # 优化目标： "ok"=最大化原位可吸附孔位数(ok_flag)；"kept"=最大化最终有效支撑数(keep_flag)；"ring"=最大化最终一圈支撑数量
 OFFSET_SCAN_OBJECTIVE = "kept"
 # 目标相同的情况下的次级排序（从左到右）
@@ -931,6 +934,116 @@ def add_world_axes_actor(pl: pv.Plotter,
             )
 
 
+def compute_platform_real_coordinates(grid2d_all: np.ndarray,
+                                      nodes_xyz: np.ndarray,
+                                      rows: int = GRID_ROWS,
+                                      cols: int = GRID_COLS,
+                                      spacing: float = GRID_SPACING_M,
+                                      platform_to_panel_min_height: float = PLATFORM_TO_PANEL_MIN_HEIGHT_M):
+    """
+    计算平台孔位在真实场景下的坐标
+
+    参数:
+        grid2d_all: 投影到薄板上的网格点 (N, 2)，PCA对齐坐标系
+        nodes_xyz: 薄板点云 (M, 3)，用于计算Z方向高度
+        rows: 平台行数
+        cols: 平台列数
+        spacing: 孔位间距 (米)
+        platform_to_panel_min_height: 平台平面到壁板最低点的初始高度 (米)，默认0.35m
+
+    返回:
+        platform_holes_real_3d: 平台孔位的真实3D坐标 (N, 3)
+        platform_base_point: 平台基准点（左下角第一个孔）的坐标 (x, y, z)
+        hole_heights: 每个孔位到壁板的高度信息 (N,)
+    """
+    # 从grid2d_all反推平台基准点
+    # grid2d_all是按行列顺序生成的，第一个点就是左下角
+    if len(grid2d_all) != rows * cols:
+        raise ValueError(f"grid2d_all长度 {len(grid2d_all)} 不等于 rows*cols={rows*cols}")
+
+    # 计算壁板的最低点Z坐标
+    panel_z_min = nodes_xyz[:, 2].min()
+
+    # 平台的Z坐标 = 壁板最低点 - 初始高度
+    z_platform = panel_z_min - platform_to_panel_min_height
+
+    # 平台基准点：左下角第一个孔位
+    platform_base_point = np.array([grid2d_all[0, 0], grid2d_all[0, 1], z_platform])
+
+    # 生成平台孔位的真实坐标（在平台自身坐标系中）
+    # 平台坐标系：XY方向与薄板PCA坐标系相同，Z=z_platform
+    platform_holes_real_3d = np.zeros((rows * cols, 3))
+
+    idx = 0
+    for r in range(rows):
+        for c in range(cols):
+            # 平台孔位的真实坐标 = 基准点 + 偏移
+            x_real = platform_base_point[0] + c * spacing
+            y_real = platform_base_point[1] + r * spacing
+            z_real = z_platform
+            platform_holes_real_3d[idx] = [x_real, y_real, z_real]
+            idx += 1
+
+    # 计算每个孔位到壁板的高度（需要投影到壁板表面）
+    # 使用lift_points_to_surface获取投影点的Z坐标
+    from scipy.spatial import cKDTree
+    tree = cKDTree(nodes_xyz[:, :2])  # 只用XY坐标建树
+
+    hole_heights = np.zeros(rows * cols)
+    for i in range(rows * cols):
+        # 找到最近的薄板点
+        xy_query = platform_holes_real_3d[i, :2]
+        dists, indices = tree.query(xy_query, k=12)
+
+        # 使用最近的k个点的Z坐标的平均值作为该位置的壁板高度
+        nearby_z = nodes_xyz[indices, 2]
+        panel_z_at_hole = nearby_z.mean()
+
+        # 孔位到壁板的高度 = 壁板Z - 平台Z
+        hole_heights[i] = panel_z_at_hole - z_platform
+
+    return platform_holes_real_3d, platform_base_point, hole_heights
+
+
+def export_platform_coordinates(platform_holes_real_3d: np.ndarray,
+                                platform_base_point: np.ndarray,
+                                hole_heights: np.ndarray,
+                                rows: int = GRID_ROWS,
+                                cols: int = GRID_COLS,
+                                export_path: str = "platform_coordinates.csv"):
+    """
+    导出平台孔位坐标到CSV文件
+
+    参数:
+        platform_holes_real_3d: 平台孔位的真实3D坐标 (N, 3)
+        platform_base_point: 平台基准点坐标 (3,)
+        hole_heights: 每个孔位到壁板的高度 (N,)
+        rows: 平台行数
+        cols: 平台列数
+        export_path: 导出文件路径
+    """
+    os.makedirs(os.path.dirname(export_path) if os.path.dirname(export_path) else ".", exist_ok=True)
+
+    with open(export_path, "w", encoding="utf-8") as f:
+        f.write("# Platform Coordinate System Information\n")
+        f.write(f"# Base Point (left-bottom corner, first hole): X={platform_base_point[0]:.6f}m, Y={platform_base_point[1]:.6f}m, Z={platform_base_point[2]:.6f}m\n")
+        f.write(f"# Grid: {rows} rows x {cols} cols = {rows*cols} holes\n")
+        f.write(f"# Spacing: {GRID_SPACING_M}m\n")
+        f.write(f"# Platform to panel min height: {PLATFORM_TO_PANEL_MIN_HEIGHT_M}m ({PLATFORM_TO_PANEL_MIN_HEIGHT_M*1000:.0f}mm)\n")
+        f.write("#\n")
+        f.write("row,col,x_real(m),y_real(m),z_real(m),height_to_panel(m),height_to_panel(mm)\n")
+
+        idx = 0
+        for r in range(rows):
+            for c in range(cols):
+                x, y, z = platform_holes_real_3d[idx]
+                h = hole_heights[idx]
+                f.write(f"{r},{c},{x:.6f},{y:.6f},{z:.6f},{h:.6f},{h*1000:.2f}\n")
+                idx += 1
+
+    print(f"💾 已导出平台孔位坐标: {export_path}")
+
+
 def visualize_scene(nodes_xyz: np.ndarray,
                     outer3d: np.ndarray,
                     offset3d: np.ndarray,
@@ -941,10 +1054,14 @@ def visualize_scene(nodes_xyz: np.ndarray,
                     kept_label_pts3d: np.ndarray,
                     kept_labels: list,
                     seg_poly: pv.PolyData,
+                    platform_holes_real_3d: np.ndarray = None,
+                    platform_holes_projected_3d: np.ndarray = None,
+                    hole_heights: np.ndarray = None,
                     fixture_radius_m: float = FIXTURE_RADIUS_M,
                     show_fixture_spheres: bool = True,
                     sphere_opacity: float = 0.18,
-                    show_move_labels: bool = True):
+                    show_move_labels: bool = True,
+                    show_height_labels: bool = True):
     cloud = pv.PolyData(nodes_xyz)
     pl = pv.Plotter()
     pl.set_background("white")
@@ -1005,8 +1122,46 @@ def visualize_scene(nodes_xyz: np.ndarray,
             shape_opacity=0.25
         )
 
+    # 可视化平台孔位：真实位置（蓝色）vs 投影位置（绿色）
+    if platform_holes_real_3d is not None and len(platform_holes_real_3d) > 0:
+        pl.add_mesh(pv.PolyData(platform_holes_real_3d), color="blue", point_size=12,
+                   render_points_as_spheres=True, label="Platform holes (real)")
+
+    if platform_holes_projected_3d is not None and len(platform_holes_projected_3d) > 0:
+        pl.add_mesh(pv.PolyData(platform_holes_projected_3d), color="lime", point_size=10,
+                   render_points_as_spheres=True, label="Platform holes (projected)")
+
+    # 连线显示对应关系
+    if (platform_holes_real_3d is not None and platform_holes_projected_3d is not None and
+        len(platform_holes_real_3d) == len(platform_holes_projected_3d) and len(platform_holes_real_3d) > 0):
+        correspondence_poly = make_segment_polydata(platform_holes_real_3d, platform_holes_projected_3d)
+        pl.add_mesh(correspondence_poly, color="cyan", line_width=1, opacity=0.3)
+
+    # 显示每个孔位到壁板的高度标签
+    if show_height_labels and hole_heights is not None and platform_holes_real_3d is not None and len(platform_holes_real_3d) > 0:
+        # 在平台孔位和投影位置的中点显示高度标签
+        if platform_holes_projected_3d is not None and len(platform_holes_projected_3d) == len(platform_holes_real_3d):
+            label_positions = (platform_holes_real_3d + platform_holes_projected_3d) / 2.0
+        else:
+            # 如果没有投影位置，就在平台孔位上方显示
+            label_positions = platform_holes_real_3d.copy()
+            label_positions[:, 2] += 0.05  # 向上偏移50mm
+
+        # 生成高度标签（单位：mm）
+        height_labels = [f"{h*1000:.0f}mm" for h in hole_heights]
+
+        pl.add_point_labels(
+            label_positions,
+            height_labels,
+            font_size=10,
+            point_size=0,
+            shape_opacity=0.2,
+            text_color="blue"
+        )
+
     pl.add_text(
         "LightGray:grid | Black:invalid | Magenta:valid(moved) | Red:original position | Yellow:nodes covered\n"
+        "Blue:Platform holes (real) | Lime:Platform holes (projected) | Cyan:correspondence | Blue labels:height(mm)\n"
         "NOTE: XY axes are PCA-aligned (not original CAD global axes). Grid coordinates shown are PCA-XY.",
         font_size=11
     )
@@ -1194,6 +1349,48 @@ def main():
     # 生成移动连线
     seg_poly = make_segment_polydata(kept_base3d, kept_moved3d)
 
+    # 计算平台孔位的真实坐标和投影坐标
+    print("\n" + "="*60)
+    print("🔧 计算平台孔位坐标")
+    print("="*60)
+
+    # 平台孔位的真实坐标（考虑350mm初始高度）
+    platform_holes_real_3d, platform_base_point, hole_heights = compute_platform_real_coordinates(
+        grid2d_all=grid2d_all,
+        nodes_xyz=nodes,
+        rows=GRID_ROWS,
+        cols=GRID_COLS,
+        spacing=GRID_SPACING_M,
+        platform_to_panel_min_height=PLATFORM_TO_PANEL_MIN_HEIGHT_M
+    )
+
+    # 平台孔位投影到薄板上的坐标（使用lift_points_to_surface）
+    platform_holes_projected_3d = lift_points_to_surface(nodes, grid2d_all, k=12)
+
+    panel_z_min = nodes[:, 2].min()
+    print(f"📍 壁板最低点Z坐标: {panel_z_min:.6f}m")
+    print(f"📍 平台Z坐标: {platform_base_point[2]:.6f}m (壁板最低点 - {PLATFORM_TO_PANEL_MIN_HEIGHT_M*1000:.0f}mm)")
+    print(f"📍 平台基准点（左下角第一个孔）: X={platform_base_point[0]:.6f}m, Y={platform_base_point[1]:.6f}m, Z={platform_base_point[2]:.6f}m")
+    print(f"📊 平台孔位数量: {len(platform_holes_real_3d)} ({GRID_ROWS}行 × {GRID_COLS}列)")
+    print(f"📏 孔位间距: {GRID_SPACING_M}m")
+
+    # 高度统计
+    print(f"📐 孔位到壁板的高度: min={hole_heights.min()*1000:.2f}mm, mean={hole_heights.mean()*1000:.2f}mm, max={hole_heights.max()*1000:.2f}mm")
+
+    # 计算平台孔位与投影位置的3D距离统计
+    distances_3d = np.linalg.norm(platform_holes_real_3d - platform_holes_projected_3d, axis=1)
+    print(f"📐 平台孔位到薄板投影的3D距离: min={distances_3d.min():.4f}m, mean={distances_3d.mean():.4f}m, max={distances_3d.max():.4f}m")
+
+    # 导出平台孔位坐标
+    export_platform_coordinates(
+        platform_holes_real_3d=platform_holes_real_3d,
+        platform_base_point=platform_base_point,
+        hole_heights=hole_heights,
+        rows=GRID_ROWS,
+        cols=GRID_COLS,
+        export_path=os.path.join(EXPORT_DIR, "platform_holes_real_coordinates.csv")
+    )
+
     visualize_scene(
         nodes_xyz=nodes,
         outer3d=outer3d,
@@ -1205,10 +1402,14 @@ def main():
         kept_label_pts3d=kept_label_pts3d,
         kept_labels=kept_labels,
         seg_poly=seg_poly,
+        platform_holes_real_3d=platform_holes_real_3d,
+        platform_holes_projected_3d=platform_holes_projected_3d,
+        hole_heights=hole_heights,
         fixture_radius_m=FIXTURE_RADIUS_M,
         show_fixture_spheres=True,
         sphere_opacity=0.18,
-        show_move_labels=SHOW_MOVE_LABELS
+        show_move_labels=SHOW_MOVE_LABELS,
+        show_height_labels=True
     )
 
 if __name__ == "__main__":
