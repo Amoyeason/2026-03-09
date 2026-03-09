@@ -1,0 +1,22 @@
+# vscode
+.vscode/
+
+# python
+__pycache__/
+*.pyc
+
+# logs
+logs_*/
+
+# ansys temp files
+ansys_temp/
+ansys_temp_manual/
+ansys_temp_verify/
+ansys_debug_clean/
+
+# models
+models_*/
+
+# cache
+*.npz
+*.npy
